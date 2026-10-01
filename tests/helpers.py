@@ -4,6 +4,7 @@ from pathlib import Path
 from sync.applier import SyncApplier
 from sync.checkpoint import CheckpointStore
 from sync.models import ChangeRecord, Column, Op
+from sync.rejections import RejectionStore
 from sync.schema_registry import SchemaRegistry
 from sync.source import LocalSource
 from sync.target import LocalTarget
@@ -14,6 +15,12 @@ USER_COLUMNS = [
     Column("age", "int", nullable=True, default=0),
 ]
 
+ORDER_COLUMNS = [
+    Column("id", "int", nullable=False),
+    Column("user_id", "int", nullable=False),
+    Column("amount", "float", nullable=False),
+]
+
 
 def make_env(tmp_path: Path):
     schemas = SchemaRegistry()
@@ -21,13 +28,30 @@ def make_env(tmp_path: Path):
     source = LocalSource(tmp_path / "source.jsonl")
     target = LocalTarget(tmp_path / "target.json")
     checkpoints = CheckpointStore(tmp_path / "checkpoint.json")
-    applier = SyncApplier(target, checkpoints, schemas, tmp_path / "applier_state.json")
+    rejections = RejectionStore(tmp_path / "rejections.json")
+    applier = SyncApplier(target, checkpoints, schemas, tmp_path / "applier_state.json",
+                          rejections=rejections)
     return schemas, source, target, checkpoints, applier
 
 
-def rec(seq, pk, op, fields, table="users", schema_version=1):
+def make_tx_env(tmp_path: Path):
+    """跨表事务测试环境：users + orders 两张表，暴露被拒事务存档。"""
+    schemas = SchemaRegistry()
+    schemas.register("users", "id", USER_COLUMNS)
+    schemas.register("orders", "id", ORDER_COLUMNS)
+    source = LocalSource(tmp_path / "source.jsonl")
+    target = LocalTarget(tmp_path / "target.json")
+    checkpoints = CheckpointStore(tmp_path / "checkpoint.json")
+    rejections = RejectionStore(tmp_path / "rejections.json")
+    applier = SyncApplier(target, checkpoints, schemas, tmp_path / "applier_state.json",
+                          rejections=rejections)
+    return schemas, source, target, checkpoints, applier, rejections
+
+
+def rec(seq, pk, op, fields, table="users", schema_version=1, tx_id=None, tx_total=None):
     return ChangeRecord(seq=seq, table=table, pk=pk, op=op,
-                        fields=fields, schema_version=schema_version)
+                        fields=fields, schema_version=schema_version,
+                        tx_id=tx_id, tx_total=tx_total)
 
 
 def sample_changes():

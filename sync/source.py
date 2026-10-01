@@ -8,7 +8,7 @@ from .models import ChangeRecord, Op
 
 
 def record_to_dict(r: ChangeRecord) -> dict:
-    return {
+    d = {
         "seq": r.seq,
         "table": r.table,
         "pk": r.pk,
@@ -16,6 +16,10 @@ def record_to_dict(r: ChangeRecord) -> dict:
         "fields": r.fields,
         "schema_version": r.schema_version,
     }
+    if r.tx_id is not None:
+        d["tx_id"] = r.tx_id
+        d["tx_total"] = r.tx_total
+    return d
 
 
 def record_from_dict(d: dict) -> ChangeRecord:
@@ -26,6 +30,8 @@ def record_from_dict(d: dict) -> ChangeRecord:
         op=Op(d["op"]),
         fields=d["fields"],
         schema_version=d["schema_version"],
+        tx_id=d.get("tx_id"),
+        tx_total=d.get("tx_total"),
     )
 
 

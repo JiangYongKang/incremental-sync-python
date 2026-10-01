@@ -47,6 +47,17 @@ class LocalTarget:
         with self._lock:
             return {k: dict(v) for k, v in self._data.get(table, {}).items()}
 
+    def apply_atomic(self, fn) -> None:
+        """在同一把锁内执行一批变更并一次落盘。
+
+        读者（get/rows）在同一锁上互斥，因此任何时刻观察到的都是
+        这批变更“全部生效前”或“全部生效后”，绝看不到中间态。
+        fn 接收 self，可在其中调用 get/upsert/delete（RLock 可重入）。
+        """
+        with self._lock:
+            fn(self)
+            self.flush()
+
     def flush(self) -> None:
         with self._lock:
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")

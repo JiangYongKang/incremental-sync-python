@@ -47,6 +47,8 @@ class ChangeRecord:
     op: Op
     fields: dict[str, Any]   # insert/update 的字段值；delete 为空
     schema_version: int
+    tx_id: str | None = None    # 业务事务标记；None 表示单条变更（非事务）
+    tx_total: int | None = None  # 该事务的记录总条数（上游在每条事务记录上声明）
 
 
 @dataclass(frozen=True)
@@ -56,9 +58,20 @@ class Rejection:
     detail: str
 
 
+@dataclass(frozen=True)
+class TxRejection:
+    """整个事务被拒绝（组内任一记录非法则整体拒绝，结论确定且稳定）。"""
+    tx_id: str
+    reason: RejectReason
+    detail: str
+    records: tuple[ChangeRecord, ...]  # 事务内全部记录，完整留存
+
+
 @dataclass
 class ApplyResult:
     applied: list[ChangeRecord] = field(default_factory=list)
     duplicates: list[ChangeRecord] = field(default_factory=list)  # 重复投递被幂等跳过
     rejected: list[Rejection] = field(default_factory=list)
     committed_seq: int | None = None  # 本次确认的位点
+    applied_txs: list[str] = field(default_factory=list)      # 本次整体生效的事务
+    rejected_txs: list[TxRejection] = field(default_factory=list)  # 本次整体拒绝的事务
