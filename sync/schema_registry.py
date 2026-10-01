@@ -4,6 +4,16 @@ from __future__ import annotations
 from .models import Column, TableSchema
 
 
+def _column_to_dict(c: Column) -> dict:
+    return {"name": c.name, "type": c.type, "nullable": c.nullable,
+            "default": c.default}
+
+
+def _column_from_dict(d: dict) -> Column:
+    return Column(name=d["name"], type=d["type"], nullable=d["nullable"],
+                  default=d.get("default"))
+
+
 class SchemaIncompatibleError(Exception):
     """无法兼容的结构变化（删列、改名、改类型）。"""
 
@@ -57,3 +67,21 @@ class SchemaRegistry:
         )
         self._schemas[table] = schema
         return schema
+
+    # ---- 快照与恢复（随原子提交日志一起持久化） ----
+
+    def snapshot(self) -> dict[str, dict]:
+        return {
+            t: {"version": s.version, "pk": s.pk,
+                "columns": [_column_to_dict(c) for c in s.columns]}
+            for t, s in self._schemas.items()
+        }
+
+    def restore(self, snap: dict[str, dict]) -> None:
+        """按快照重建注册表（进程重启后调用）。"""
+        self._schemas = {}
+        for table, data in snap.items():
+            self._schemas[table] = TableSchema(
+                table=table, version=data["version"], pk=data["pk"],
+                columns=tuple(_column_from_dict(c) for c in data["columns"])
+            )

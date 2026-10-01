@@ -19,6 +19,11 @@ schemas.register("users", "id", [
     Column("name", "str", nullable=False),
     Column("age", "int", nullable=True, default=0),
 ])
+schemas.register("orders", "id", [
+    Column("id", "int", nullable=False),
+    Column("user_id", "int", nullable=False),
+    Column("amount", "int", nullable=False),
+])
 source = LocalSource(DATA_DIR / "source.jsonl")
 target = LocalTarget(DATA_DIR / "target.json")
 checkpoints = CheckpointStore(DATA_DIR / "checkpoint.json")
@@ -41,6 +46,9 @@ def sync_run():
         "duplicates": [r.seq for r in result.duplicates],
         "rejected": [{"seq": rj.record.seq, "reason": rj.reason.value,
                       "detail": rj.detail} for rj in result.rejected],
+        "committed_txns": result.committed_txns,
+        "rejected_txns": [rt.txn_id for rt in result.rejected_txns],
+        "staged_txns": result.staged_txns,
         "confirmed_seq": result.committed_seq,
     }
 
@@ -50,5 +58,10 @@ def sync_status():
     return {
         "confirmed_seq": checkpoints.load(),
         "next_source_seq": source.next_seq(),
-        "tables": {t: target.rows(t) for t in ["users"]},
+        "tables": {t: target.rows(t) for t in ["users", "orders"]},
+        "dead_letters": [
+            {"txn_id": d.txn_id, "commit_seq": d.commit_seq,
+             "primary_reason": d.primary_reason.value}
+            for d in applier.rejected_transactions()
+        ],
     }

@@ -47,6 +47,18 @@ class LocalTarget:
         with self._lock:
             return {k: dict(v) for k, v in self._data.get(table, {}).items()}
 
+    def all_tables(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """全部表的深拷贝（原子快照使用）。"""
+        with self._lock:
+            return {t: {k: dict(v) for k, v in rows.items()}
+                    for t, rows in self._data.items()}
+
+    def replace_all(self, data: dict[str, dict[str, dict[str, Any]]]) -> None:
+        """以权威快照整体替换内存数据（崩溃恢复使用）。"""
+        with self._lock:
+            self._data = {t: {k: dict(v) for k, v in rows.items()}
+                          for t, rows in data.items()}
+
     def flush(self) -> None:
         with self._lock:
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
