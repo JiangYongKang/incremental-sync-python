@@ -5,13 +5,19 @@
   含成员 seq 列表）构成一个事务单元；无 txn_id 的记录视为单条隐式事务。
 - 原子可见：事务记录先进暂存区，成员到齐且整组校验通过后才一次性生效；
   任一成员非法则整事务拒绝（死信），目标端永远看不到半个事务。
+  生效动作本身也是原子的：整组行变更（可跨表）在同一把目标端锁内一次
+  写入（LocalTarget.apply_atomic），因此即使在事务生效过程中有并发读者，
+  读到的也只能是”整组生效前”或”整组生效后”，绝不会是跨表各读一半的
+  中间态；跨表一致读取须用 read_snapshot/all_tables（单次加锁）。
 - 有序决议：单元按提交位点（隐式=记录 seq，显式=提交标记 seq）排序决议；
   前序单元未到齐或遇暂时性主键冲突时阻塞，绝不越过空洞或未决议单元。
 - 幂等去重：seq <= 已确认位点、已消费未确认、死信事务重投均判重，跳过。
-  最终结果与“按顺序只投递一次”一致，重复投递/乱序分批/并发提交均成立。
+  最终结果与”按顺序只投递一次”一致，重复投递/乱序分批/并发提交均成立。
 - 原子落盘：CommitLogger 以 tmp+replace 原子写入完整快照（数据、位点、
   结构、键水位、暂存、死信）；旁路文件（target/checkpoint/死信视图）在
   快照落盘后尽力重写，重启一律以快照为准恢复，位点不超过已生效数据。
+  提交中途写盘报错或进程被杀：整组事务随旧快照一起回滚，重启续传后
+  重投，要么整组生效、要么整组拒绝，绝不残留半组。
 """
 from __future__ import annotations
 
@@ -242,20 +248,30 @@ class SyncApplier:
     # ================= 单事务生效 =================
 
     def _apply_unit(self, records: list[ChangeRecord], unit_seq: int) -> None:
+        """整组事务原子生效：先算好全部行变更，再一次加锁落进目标端。
+
+        目标端锁在整组写入期间不释放，任何并发读者（read_snapshot /
+        all_tables / rows）要么看到整组生效前、要么看到整组生效后，
+        绝不会看到跨表事务只生效了一半的中间态。
+        """
+        # 阶段一：在应用器锁内（无并发写者）算出整组行变更
+        ops: list[tuple[str, str, Any, dict[str, Any] | None]] = []
         for r, schema in [(r, self.schemas.current(r.table))
                           for r in sorted(records, key=lambda x: x.seq)]:
-            cols = schema.column_map()
             if r.op is Op.INSERT:
                 row = {c.name: c.default for c in schema.columns}
                 row.update(r.fields)
                 row[schema.pk] = r.pk
-                self.target.upsert(r.table, r.pk, row)
+                ops.append(("upsert", r.table, r.pk, row))
             elif r.op is Op.UPDATE:
                 row = self.target.get(r.table, r.pk) or {}
                 row.update(r.fields)
-                self.target.upsert(r.table, r.pk, row)
+                ops.append(("upsert", r.table, r.pk, row))
             else:
-                self.target.delete(r.table, r.pk)
+                ops.append(("delete", r.table, r.pk, None))
+        # 阶段二：同一把目标端锁内一次性生效（原子可见边界）
+        self.target.apply_atomic(ops)
+        for r in records:
             self._pk_hwm.setdefault(r.table, {})[str(r.pk)] = r.seq
 
     # ================= 批处理入口 =================
@@ -417,7 +433,18 @@ class SyncApplier:
                 new_confirmed += 1
                 self._pending.discard(new_confirmed)
             if resolved_any or intake_dirty or new_confirmed > confirmed:
-                self._persist_atomic(new_confirmed)
+                try:
+                    self._persist_atomic(new_confirmed)
+                except BaseException:
+                    # 落盘失败（写盘报错等）：内存状态整体回滚到最后一份已确认
+                    # 快照，保证数据/位点/暂存/死信始终互相自洽——本批事件视为
+                    # 未消费，重投后要么整组生效、要么整组拒绝，绝不残留半组。
+                    snap = self._journal.recover()
+                    if snap is not None:
+                        self._restore_state(snap)
+                        logger.warning("persist failed, rolled back to confirmed=%d",
+                                       snap["confirmed_seq"])
+                    raise
                 if new_confirmed > confirmed:
                     logger.info("checkpoint %d -> %d", confirmed, new_confirmed)
             result.committed_seq = self.checkpoints.load()

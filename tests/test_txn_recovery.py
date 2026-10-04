@@ -135,3 +135,39 @@ def test_restart_sidecar_files_lag_behind_journal(tmp_path):
     recs1, commit1 = _txn(1, 4)
     r = applier2.apply_batch([*recs1, commit1])
     assert r.committed_txns == ["T1"] and checkpoints2.load() == 6
+
+
+def test_persist_failure_rolls_back_in_memory_state(tmp_path):
+    """写盘报错后（进程未重启）：内存中的数据/位点/死信整体回滚到已确认快照，
+    同进程重投后整组正确生效，绝不残留半组。"""
+    _, _, target, checkpoints, applier = _env(tmp_path)
+    recs0, commit0 = _txn(0, 1)
+    applier.apply_batch([*recs0, commit0])  # T0 生效，位点 3
+
+    applier._journal._fail_after_bytes = 8  # 注入写盘失败
+    recs1, commit1 = _txn(1, 4)
+    try:
+        applier.apply_batch([*recs1, commit1])
+        assert False, "应当抛出写盘错误"
+    except OSError:
+        pass
+
+    # 不重启：内存视图必须与最后一份已确认快照自洽——T1 半点不留
+    assert checkpoints.load() == 3
+    assert target.rows("orders") == {"100": {"id": 100, "amount": 0}}
+    assert "101" not in target.rows("users")
+    assert applier.rejected_transactions() == []
+
+    # 解除故障，同进程重投 T1：整组生效，位点与数据一起推进
+    applier._journal._fail_after_bytes = None
+    r = applier.apply_batch([*recs1, commit1])
+    assert r.committed_txns == ["T1"]
+    assert checkpoints.load() == 6
+    assert target.rows("orders")["101"] == {"id": 101, "amount": 10}
+    assert target.rows("users")["101"] == {"id": 101, "name": "u1", "age": 0}
+
+    # 再重启校验：落盘状态同样完整自洽
+    _, target2, checkpoints2, _ = _rebuild(tmp_path)
+    assert checkpoints2.load() == 6
+    assert target2.rows("orders")["101"] == {"id": 101, "amount": 10}
+    assert target2.rows("users")["101"] == {"id": 101, "name": "u1", "age": 0}

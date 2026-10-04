@@ -55,10 +55,11 @@ def sync_run():
 
 @app.get("/sync/status")
 def sync_status():
+    # 跨表一致快照：单次加锁读取，不会拼出"半个事务"的中间态
     return {
         "confirmed_seq": checkpoints.load(),
         "next_source_seq": source.next_seq(),
-        "tables": {t: target.rows(t) for t in ["users", "orders"]},
+        "tables": target.read_snapshot(["users", "orders"]),
         "dead_letters": [
             {"txn_id": d.txn_id, "commit_seq": d.commit_seq,
              "primary_reason": d.primary_reason.value}
