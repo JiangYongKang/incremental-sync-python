@@ -55,13 +55,17 @@ def sync_run():
 
 @app.get("/sync/status")
 def sync_status():
+    # 一次整组一致读取：数据、位点、死信取自同一决议版本，并发提交进行中
+    # 也只会读到提交前或提交后的完整状态（不会读到半个跨表事务）。
+    view = applier.consistent_view()
     return {
-        "confirmed_seq": checkpoints.load(),
+        "confirmed_seq": view.confirmed_seq,
         "next_source_seq": source.next_seq(),
-        "tables": {t: target.rows(t) for t in ["users", "orders"]},
+        "generation": view.generation,
+        "tables": {t: view.tables.get(t, {}) for t in ["users", "orders"]},
         "dead_letters": [
             {"txn_id": d.txn_id, "commit_seq": d.commit_seq,
              "primary_reason": d.primary_reason.value}
-            for d in applier.rejected_transactions()
+            for d in sorted(view.dead.values(), key=lambda d: d.commit_seq)
         ],
     }

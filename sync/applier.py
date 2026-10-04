@@ -3,8 +3,16 @@
 一致性语义：
 - 事务分组：变更记录携带 txn_id，同一 txn_id 的记录 + 提交标记（TxnCommit，
   含成员 seq 列表）构成一个事务单元；无 txn_id 的记录视为单条隐式事务。
-- 原子可见：事务记录先进暂存区，成员到齐且整组校验通过后才一次性生效；
-  任一成员非法则整事务拒绝（死信），目标端永远看不到半个事务。
+- 原子可见（含并发读者）：一批事件的全部决议（校验/沙盘推演/生效）都在
+  **私有工作副本**上完成，期间已发布目标端零变更；journal 把整批新状态
+  （全部新行 + 位点 + 死信）原子落盘成功后，目标端才通过一次**不可变整库
+  快照替换**发布。因此并发读者在任何时刻读到的不是提交前整库、就是提交后
+  整库，绝不会抓到“某表已生效、某表仍为空”的半个跨表事务；读到的内容只
+  可能是若干个完整事务的组合。需要“数据 + 位点 + 死信”严格自洽的读者请用
+  consistent_view()（在同一把锁、同一版本内取样）。
+- 提交失败原子回滚：journal 写盘报错时，本批对内存（目标端/位点/暂存/死信/
+  高水位）的改动整体回滚到批前已 durable 基线，进程内也无半成品；重启后一律
+  以最后一份完整快照为准，从已确认位点重投即可整组生效或整组被拒。
 - 有序决议：单元按提交位点（隐式=记录 seq，显式=提交标记 seq）排序决议；
   前序单元未到齐或遇暂时性主键冲突时阻塞，绝不越过空洞或未决议单元。
 - 幂等去重：seq <= 已确认位点、已消费未确认、死信事务重投均判重，跳过。
@@ -19,6 +27,7 @@ import hashlib
 import json
 import logging
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +60,15 @@ def _fingerprint(txn_id: str, commit_seq: int,
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True)
+class ConsistentView:
+    """整组一致的只读视图：同一次读取内数据、位点、死信互相自洽。"""
+    generation: int
+    confirmed_seq: int
+    tables: dict[str, dict[str, dict[str, Any]]]
+    dead: dict[str, "RejectedTransaction"]
+
+
 class SyncApplier:
     def __init__(self, target: LocalTarget, checkpoints: CheckpointStore,
                  schemas: SchemaRegistry, state_path: Path | None = None,
@@ -68,6 +86,13 @@ class SyncApplier:
         self._pk_hwm: dict[str, dict[str, int]] = {}  # table -> pk -> 已生效最大记录 seq
         self._staging: dict[str, dict] = {}             # txn_id -> {records, commit}
         self._dead: dict[str, RejectedTransaction] = {}  # txn_id -> 死信
+        # 提交窗口期：即将发布但尚未 replace_all 的私有状态；快照序列化用它，
+        # 保证“journal 内容”与“随后发布的内存状态”严格一致。默认 None=用现状。
+        self._publish_target: dict[str, Any] | None = None
+        self._publish_hwm: dict[str, dict[str, int]] | None = None
+        # 测试钩子：journal 已落盘、目标端尚未整库发布时调用（并发读用例用它
+        # 把“写已完成但不可见”的窗口拉长到确定性可断言的时间长度）。
+        self.before_visibility: Any = None
         self._journal = CommitLogger(self._journal_path, self._snapshot_state)
 
         # 崩溃恢复：journal 是权威状态；无 journal 时退回旧式 state 文件
@@ -85,9 +110,13 @@ class SyncApplier:
         return {
             "version": 1,
             "confirmed_seq": self.checkpoints.load(),
-            "target": self.target.all_tables(),
+            "target": (self._publish_target
+                       if self._publish_target is not None
+                       else self.target.all_tables()),
             "pending": sorted(self._pending),
-            "pk_hwm": self._pk_hwm,
+            "pk_hwm": (self._publish_hwm
+                       if self._publish_hwm is not None
+                       else self._pk_hwm),
             "staging": {
                 txn: {"records": [record_to_dict(r) for r in d["records"]],
                       "commit": commit_to_dict(d["commit"]) if d["commit"] else None}
@@ -132,13 +161,41 @@ class SyncApplier:
                     snap["confirmed_seq"], len(self._pending),
                     len(self._staging), len(self._dead))
 
-    def _persist_atomic(self, new_confirmed: int) -> None:
-        """数据/位点/结构/暂存/死信一起原子生效。"""
-        # 1) 位点内存视图先行（快照内容随之反映新值）
+    def _persist_atomic(self, new_confirmed: int,
+                        new_target: dict[str, Any] | None = None,
+                        new_hwm: dict[str, dict[str, int]] | None = None
+                        ) -> None:
+        """数据/位点/结构/暂存/死信一起原子生效。
+
+        顺序（对并发读者可见性至关重要）：
+        1. 先把**完整新状态**（含目标端数据）原子写入 journal——旧快照在落盘
+           成功前保持完好，此期间读者仍只看到旧状态；
+        2. journal 落盘成功后，目标端以一次引用替换**整库发布**——跨表读者
+           要么看到旧库、要么看到新库，绝不会抓到半个跨表事务；
+        3. 最后尽力重写旁路文件（checkpoint/target/dead_letters）；若在这之间
+           崩溃，重启仍以 journal 权威快照为准重放。
+        """
+        # 0) 位点内存视图先行（快照序列化随之反映新值）；让本次快照写“即将发布”
+        #    的目标端与高水位。此刻 applier 锁仍由提交方持有，consistent_view
+        #    读者会等待整批发布完成，不会抓到位点先行、数据未发布的组合。
         self.checkpoints.stage(new_confirmed)
-        # 2) 权威快照原子落盘（失败则旧文件保持完好，异常向上抛）
-        self._journal.persist()
-        # 2) 旁路文件尽力重写；若在这之间崩溃，重启仍以快照为准重放
+        self._publish_target = new_target
+        self._publish_hwm = new_hwm
+        try:
+            # 1) 权威快照原子落盘（失败抛错，旧文件完好，由调用方整体回滚内存）
+            self._journal.persist()
+        finally:
+            self._publish_target = None
+            self._publish_hwm = None
+        # journal 已 durable 而目标端尚未整库发布：此刻读者必须仍只见旧库。
+        # 测试钩子在此处显式让出时间窗，供并发读用例确定性地断言“无半成品”。
+        if new_target is not None and self.before_visibility is not None:
+            self.before_visibility()
+        # 2) 目标端一次性整库发布：跨表读者要么见旧库、要么见新库
+        if new_target is not None:
+            self.target.replace_all(new_target)
+            self._pk_hwm = new_hwm if new_hwm is not None else self._pk_hwm
+        # 3) 旁路文件尽力重写；落后于 journal 也无妨，重启时以 journal 对齐
         self.checkpoints.rewrite(new_confirmed)
         self.target.flush()
         self._write_dead_view()
@@ -192,9 +249,14 @@ class SyncApplier:
                                      f"必填字段 {c.name} 缺失")
         return None
 
-    def _validate_unit(self, records: list[ChangeRecord]
+    def _validate_unit(self, records: list[ChangeRecord],
+                       working: dict[str, dict[str, dict[str, Any]]]
                        ) -> tuple[list[Rejection], Rejection | None]:
-        """整组校验。返回（确定性拒绝列表，暂时性冲突拒绝）。"""
+        """整组校验。返回（确定性拒绝列表，暂时性冲突拒绝）。
+
+        在调用方传入的**私有工作副本**上沙盘推演：同一批中前序单元的生效结果
+        对后续单元可见，但完全不触达已发布目标端（读者看不到推演中间态）。
+        """
         deterministic: list[Rejection] = []
         # 阶段一：与行状态无关的结构/字段校验，逐成员收集（全部要报）
         validated: list[tuple[ChangeRecord, TableSchema]] = []
@@ -209,13 +271,13 @@ class SyncApplier:
                 deterministic.append(rej)
             else:
                 validated.append((r, schema))
-        # 阶段二：在目标端当前状态上按成员 seq 顺序做主键存在性沙盘推演。
+        # 阶段二：在私有工作副本上按成员 seq 顺序做主键存在性沙盘推演。
         # 即使阶段一已有确定性错误也继续收集 insert 主键冲突，保证原因完整可区分。
         scratch: dict[str, set[str]] = {}
         for r, _schema in sorted(validated, key=lambda x: x[0].seq):
             key = str(r.pk)
             exists = key in scratch.setdefault(r.table, set()) or \
-                self.target.get(r.table, r.pk) is not None
+                key in working.get(r.table, {})
             if r.op is Op.INSERT:
                 if exists:
                     deterministic.append(Rejection(
@@ -241,7 +303,10 @@ class SyncApplier:
 
     # ================= 单事务生效 =================
 
-    def _apply_unit(self, records: list[ChangeRecord], unit_seq: int) -> None:
+    def _apply_unit(self, records: list[ChangeRecord], unit_seq: int,
+                    working: dict[str, dict[str, dict[str, Any]]],
+                    hwm: dict[str, dict[str, int]]) -> None:
+        """把一个已通过整组校验的事务写进**私有工作副本**（不发布、不可见）。"""
         for r, schema in [(r, self.schemas.current(r.table))
                           for r in sorted(records, key=lambda x: x.seq)]:
             cols = schema.column_map()
@@ -249,14 +314,14 @@ class SyncApplier:
                 row = {c.name: c.default for c in schema.columns}
                 row.update(r.fields)
                 row[schema.pk] = r.pk
-                self.target.upsert(r.table, r.pk, row)
+                working.setdefault(r.table, {})[str(r.pk)] = row
             elif r.op is Op.UPDATE:
-                row = self.target.get(r.table, r.pk) or {}
+                row = dict(working.get(r.table, {}).get(str(r.pk)) or {})
                 row.update(r.fields)
-                self.target.upsert(r.table, r.pk, row)
+                working.setdefault(r.table, {})[str(r.pk)] = row
             else:
-                self.target.delete(r.table, r.pk)
-            self._pk_hwm.setdefault(r.table, {})[str(r.pk)] = r.seq
+                working.get(r.table, {}).pop(str(r.pk), None)
+            hwm.setdefault(r.table, {})[str(r.pk)] = r.seq
 
     # ================= 批处理入口 =================
 
@@ -265,6 +330,19 @@ class SyncApplier:
         result = ApplyResult()
         with self._lock:
             confirmed = self.checkpoints.load()
+            # 批前基线：journal 落盘一旦失败，内存全部滚回最后一份已 durable 状态，
+            # 绝不留下“半组事务已可见”的进程内中间态。
+            baseline = {
+                "confirmed": confirmed,
+                "target": self.target.all_tables(),
+                "pending": set(self._pending),
+                "pk_hwm": {t: dict(m) for t, m in self._pk_hwm.items()},
+                "staging": {
+                    t: {"records": list(d["records"]), "commit": d["commit"]}
+                    for t, d in self._staging.items()
+                },
+                "dead": dict(self._dead),
+            }
 
             # ---- 1. 摄入事件：去重，显式事务进暂存，隐式事务入待决议 ----
             implicit: list[ChangeRecord] = []
@@ -327,8 +405,12 @@ class SyncApplier:
                 candidates.append((commit.seq, txn_id, ordered, False, commit.seq))
             candidates.sort(key=lambda c: c[0])
 
-            # ---- 3. 有序决议：未到齐/暂时性冲突即阻塞其后所有单元 ----
+            # ---- 3. 有序决议：全部在**私有工作副本**上推演，读者全程不可见 ----
+            # 未到齐/暂时性冲突即阻塞其后所有单元；已发布目标端在本阶段零变更。
+            working = self.target.clone(baseline["target"])  # 本批新库（私有副本）
+            working_hwm = {t: dict(m) for t, m in baseline["pk_hwm"].items()}
             resolved_any = False
+            applied_any = False     # 本批确有事务数据写入（需整库发布）
             assembled: set[str] = set()
             for unit_seq, key, records, is_implicit, commit_seq in candidates:
                 txn_id = None if is_implicit else key
@@ -336,7 +418,7 @@ class SyncApplier:
                 # 或重启后续投），判重消费；整组若全部过期则直接跳过
                 live: list[ChangeRecord] = []
                 for r in records:
-                    hwm = self._pk_hwm.get(r.table, {}).get(str(r.pk), 0)
+                    hwm = working_hwm.get(r.table, {}).get(str(r.pk), 0)
                     if r.seq <= hwm:
                         result.duplicates.append(r)
                         self._pending.add(r.seq)
@@ -365,9 +447,12 @@ class SyncApplier:
                     logger.info("dup skip dead txn=%s reason=%s",
                                 txn_id, dead.primary_reason.value)
                     continue
-                rejections, transient = self._validate_unit(records)
+                rejections, transient = self._validate_unit(records, working)
                 if transient is not None:
-                    # 暂时性冲突：不消费，位点停住，等待前序变更到达后重投
+                    # 暂时性冲突：该单元不消费、位点在它之前停住，等待重投。
+                    # 排在它之前、本批已整组写入 working 的单元仍完整（位点处于
+                    # 可确认前缀），照常随本次发布；其后的单元被阻塞。全程未
+                    # 触碰已发布状态，读者不会看到推演中间态。
                     result.rejected.append(transient)
                     logger.info("reject(transient) txn=%s reason=pk_conflict pk=%r",
                                 txn_id, transient.record.pk)
@@ -393,8 +478,9 @@ class SyncApplier:
                     logger.info("txn rejected txn=%s reasons=%s",
                                 rt.txn_id, [rj.reason.value for rj in rejections])
                     continue
-                # 整组生效
-                self._apply_unit(records, unit_seq)
+                # 整组生效：仅写入私有工作副本，本批结束时一次性整库发布
+                self._apply_unit(records, unit_seq, working, working_hwm)
+                applied_any = True
                 for r in records:
                     self._pending.add(r.seq)
                     result.applied.append(r)
@@ -411,19 +497,51 @@ class SyncApplier:
             for key in assembled:
                 self._staging.pop(key, None)
 
-            # ---- 4. 位点推进到连续前缀，并原子持久化 ----
+            # ---- 4. 位点推进到连续前缀；journal 落盘后一次性整库可见 ----
             new_confirmed = confirmed
             while new_confirmed + 1 in self._pending:
                 new_confirmed += 1
                 self._pending.discard(new_confirmed)
             if resolved_any or intake_dirty or new_confirmed > confirmed:
-                self._persist_atomic(new_confirmed)
+                publish_target = working if applied_any else None
+                publish_hwm = working_hwm if applied_any else None
+                try:
+                    self._persist_atomic(
+                        new_confirmed, publish_target, publish_hwm)
+                except BaseException:
+                    # journal 写盘失败/提交进程被杀：内存整批滚回批前已 durable
+                    # 基线，读者绝不会读到半组；从已确认位点重投即可整组生效。
+                    logger.warning("journal persist 失败，回滚本批内存状态 confirmed=%d",
+                                   baseline["confirmed"])
+                    self.checkpoints.rewrite(baseline["confirmed"])
+                    self.target.replace_all(baseline["target"])
+                    self._pending = baseline["pending"]
+                    self._pk_hwm = baseline["pk_hwm"]
+                    self._staging = baseline["staging"]
+                    self._dead = baseline["dead"]
+                    raise
                 if new_confirmed > confirmed:
                     logger.info("checkpoint %d -> %d", confirmed, new_confirmed)
             result.committed_seq = self.checkpoints.load()
         return result
 
     # ================= 查询 =================
+
+    def consistent_view(self) -> ConsistentView:
+        """整组一致的只读视图：目标端快照、已确认位点、死信取自同一决议版本。
+
+        数据与位点严格自洽——视图里的全部行都是位点所确认的完整事务的结果，
+        不会出现位点已越过、行却没生效（或反之）的半成品；被拒事务与该版本
+        绑定。并发提交进行中读到的永远是**发布前**或**发布后**的完整状态。
+        """
+        with self._lock:
+            generation, tables = self.target.view()
+            return ConsistentView(
+                generation=generation,
+                confirmed_seq=self.checkpoints.load(),
+                tables=tables,
+                dead=dict(self._dead),
+            )
 
     def rejected_transactions(self) -> list[RejectedTransaction]:
         with self._lock:

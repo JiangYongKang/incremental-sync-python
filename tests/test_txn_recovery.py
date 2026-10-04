@@ -77,6 +77,59 @@ def test_persist_failure_leaves_no_partial_state(tmp_path):
     assert target2.rows("users")["101"]["name"] == "u1"
 
 
+def test_persist_failure_rolls_back_in_memory_atomically(tmp_path):
+    """写盘失败在同一进程内整体回滚：目标端/位点/暂存全部回到批前，无半组可见。"""
+    _, _, target, checkpoints, applier = _env(tmp_path)
+    # 补注册第二张跨表表，构造跨表事务
+    applier.schemas.register("billing", "id", [
+        Column("id", "int", nullable=False),
+        Column("total", "int", nullable=False),
+    ])
+    recs0 = [
+        ChangeRecord(seq=1, table="orders", pk=100, op=Op.INSERT,
+                     fields={"id": 100, "amount": 1}, schema_version=1, txn_id="T0"),
+        ChangeRecord(seq=2, table="users", pk=100, op=Op.INSERT,
+                     fields={"id": 100, "name": "u0"}, schema_version=1, txn_id="T0"),
+    ]
+    commit0 = TxnCommit(seq=3, txn_id="T0", members=(1, 2))
+    applier.apply_batch([*recs0, commit0])
+    assert checkpoints.load() == 3
+
+    bad = [
+        ChangeRecord(seq=4, table="orders", pk=101, op=Op.INSERT,
+                     fields={"id": 101, "amount": 9}, schema_version=1, txn_id="T1"),
+        ChangeRecord(seq=5, table="billing", pk=1, op=Op.INSERT,
+                     fields={"id": 1, "total": 9}, schema_version=1, txn_id="T1"),
+    ]
+    commit1 = TxnCommit(seq=6, txn_id="T1", members=(4, 5))
+    applier._journal._fail_after_bytes = 8
+    try:
+        applier.apply_batch([*bad, commit1])
+        assert False, "应当抛出写盘错误"
+    except OSError:
+        pass
+
+    # 失败后同一进程内：绝不能出现 orders 有行、billing 无行的半组状态
+    assert "101" not in target.rows("orders")
+    assert target.rows("billing") == {}
+    # T0 旧状态完好
+    assert target.rows("orders") == {"100": {"id": 100, "amount": 1}}
+    assert checkpoints.load() == 3
+    # 一致视图同样停在批前，且数据与位点自洽
+    view = applier.consistent_view()
+    assert view.confirmed_seq == 3
+    assert set(view.tables.get("orders", {})) == {"100"}
+    assert "billing" not in view.tables or view.tables["billing"] == {}
+
+    # 恢复写盘后，不重启直接重投：整组正确生效
+    applier._journal._fail_after_bytes = None
+    r = applier.apply_batch([*bad, commit1])
+    assert r.committed_txns == ["T1"]
+    assert checkpoints.load() == 6
+    assert target.rows("orders")["101"] == {"id": 101, "amount": 9}
+    assert target.rows("billing")["1"] == {"id": 1, "total": 9}
+
+
 def test_restart_mid_txn_resumes_and_commits_atomically(tmp_path):
     """成员已部分暂存（未到提交标记）时重启：续传后事务整体生效。"""
     _, _, target, checkpoints, applier = _env(tmp_path)
